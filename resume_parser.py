@@ -133,6 +133,7 @@ class Resume(BaseModel):
     email: str | None = None
     phone: str | None = None
 
+
     total_experience_years: float | None = None
 
     skills: list[str] = []
