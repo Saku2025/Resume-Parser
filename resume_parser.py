@@ -1,9 +1,12 @@
 import os
+import json
 import time
 from pathlib import Path
 from dotenv import load_dotenv
 from groq import Groq
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+from pypdf import PdfReader
+from docx import Document
 
 load_dotenv()
 my_api_key=os.getenv("GROQ_API_KEY")
@@ -12,7 +15,7 @@ if not my_api_key:
     raise ValueError("API key kaha hai bhai")
 
 client=Groq(api_key=my_api_key)
-model = "llama-3.3-70b-versatile"
+model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 job_description="""
@@ -48,79 +51,26 @@ Preferred Qualifications
 - Strong problem-solving and analytical skills
 - Excellent written and verbal communication skills
 """
+
+
 class JobD(BaseModel):
-    role: str
-    required_skills: list[str]
-    preferred_skills: list[str]
-    minimum_experience: float | None
-    education_requirements: list[str]
-    responsibilities: list[str]
-
-jobd_schema = JobD.model_json_schema()
-
-system_prompt = f"""
-You are an expert HR assistant.
-
-Your job is to analyze job descriptions and extract
-structured information from them.
-
-Return ONLY valid JSON matching this schema:
-
-{jobd_schema}
-IMPORTANT:
-Do NOT return the schema itself.
-Do NOT return fields like "properties", "title" or "type".
-Fill the schema with actual information extracted from the job description.
-
-If minimum experience is not mentioned, return null.
-If information for a list is missing, return an empty list.
-Do not invent information.
-"""
-
-user_prompt = f"""
-Analyze the following job description:
-
-{job_description}
-"""
-message_system={
-    "role" : "system",
-    "content" : system_prompt
-}
-message_user={
-    "role" : "user",
-    "content" : user_prompt
-}
-response_format={
-    "type" : "json_object"
-}
+    role: str | None = None
+    required_skills: list[str] = []
+    preferred_skills: list[str] = []
+    minimum_experience: float | None = None
+    education_requirements: list[str] = []
+    responsibilities: list[str] = []
 
 
-messages=[message_system, message_user]
-
-response=client.chat.completions.create(model=model, messages=messages, response_format=response_format)
-
-
-answer=response.choices[0].message.content
-
-raw_json=answer
-# print(raw_json)
-
-
-
-import json
-job_data=json.loads(raw_json)
-
-job = JobD(**job_data)
-
-print(job.minimum_experience)
-print(job.education_requirements)
-
-
-
-#parse real
 class MatchResult(BaseModel):
-    score: float
-    details: dict
+    candidate_name: str | None = None
+    score: float = 0
+    matching_skills: list[str] = []
+    missing_skills: list[str] = []
+    experience_met: bool | None = None
+    verdict: str = ""
+
+
 class Experience(BaseModel):
     company: str | None = None
     role: str | None = None
@@ -128,11 +78,11 @@ class Experience(BaseModel):
     description: str | None = None
     skills_used: list[str] = []
 
+
 class Resume(BaseModel):
     name: str | None = None
     email: str | None = None
     phone: str | None = None
-
 
     total_experience_years: float | None = None
 
@@ -143,9 +93,51 @@ class Resume(BaseModel):
     certifications: list[str] = []
 
 
+jobd_schema = JobD.model_json_schema()
 resume_schema = Resume.model_json_schema()
-def final_score(job,resume):
-    match_schema = MatchResult.model_json_schema()
+match_schema = MatchResult.model_json_schema()
+
+
+def ask_llm_json(messages):
+    response_format={
+        "type": "json_object"
+    }
+    response=client.chat.completions.create(model=model, messages=messages, response_format=response_format)
+    return json.loads(response.choices[0].message.content)
+
+
+def parse_job(job_text):
+    system_prompt = f"""
+    You are an expert HR assistant.
+
+    Your job is to analyze job descriptions and extract
+    structured information from them.
+
+    Return ONLY valid JSON matching this schema:
+
+    {jobd_schema}
+    IMPORTANT:
+    Do NOT return the schema itself.
+    Do NOT return fields like "properties", "title" or "type".
+    Fill the schema with actual information extracted from the job description.
+
+    If minimum experience is not mentioned, return null.
+    If information for a list is missing, return an empty list.
+    Do not invent information.
+    """
+    user_prompt = f"""
+    Analyze the following job description:
+
+    {job_text}
+    """
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return JobD(**ask_llm_json(messages))
+
+
+def final_score(job, resume):
     prompt = f"""
     You are an HR recruiter.
 
@@ -156,32 +148,29 @@ def final_score(job,resume):
 
     CANDIDATE RESUME:
     {resume.model_dump_json(indent=2)}
-    Return JSON matching this schema:
+
+    Return ONLY valid JSON matching this schema
+    (fill it with values, do NOT return the schema itself):
 
     {match_schema}
 
-    Give me:
-
-    1. Candidate name
-    2. Matching skills
-    3. Missing important skills
-    4. Whether experience requirement is met
-    5. Overall match percentage from 0 to 100
-    6. A short final verdict
-
-    Keep the response concise and easy to read.
+    Field meanings:
+    - candidate_name: the candidate's name
+    - score: overall match percentage from 0 to 100
+    - matching_skills: job skills the candidate has
+    - missing_skills: important job skills the candidate is missing
+    - experience_met: whether the experience requirement is met
+    - verdict: a short final verdict (1-2 sentences)
     """
-    message={
-        "role": "user",
-        "content" : prompt
-    }
-    messages=[message]
-    response_format={
-        "type": "json_object"
-    }
-    response = client.chat.completions.create(model=model, messages=messages, response_format=response_format)
-    data = json.loads(response.choices[0].message.content)
-    return MatchResult(**data)
+    messages=[{"role": "user", "content": prompt}]
+    result = MatchResult(**ask_llm_json(messages))
+    # some models answer 0-1 instead of 0-100
+    if 0 < result.score <= 1:
+        result.score *= 100
+    result.score = max(0, min(100, round(result.score, 1)))
+    return result
+
+
 def parse_resume(resume_text):
     system_prompt = f"""
     You are an expert resume parser.
@@ -214,35 +203,23 @@ def parse_resume(resume_text):
     3. If a list has no information, return an empty list.
     4. Include internships inside experiences.
     5. Extract skills mentioned across the entire resume.
+    6. projects, education and certifications must be lists of plain strings.
     """
     user_prompt = f"""
     Parse the following resume:
 
     {resume_text}
     """
-    message_system={
-        "role" : "system",
-        "content" : system_prompt
-    }
-    message_user={
-        "role" : "user",
-        "content" : user_prompt
-    }
-    messages=[message_system, message_user]
-    response_format={
-        "type": "json_object"
-    }
-    response=client.chat.completions.create(model=model, messages=messages, response_format=response_format)
-    raw_output = response.choices[0].message.content
-    data = json.loads(raw_output)
-    resume = Resume(**data)
-    return resume
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    return Resume(**ask_llm_json(messages))
 
 
-from pypdf import PdfReader
-from docx import Document
-def read_pdf(file_path):
-    reader = PdfReader(file_path)
+# file can be a path or an open file object (e.g. an upload)
+def read_pdf(file):
+    reader = PdfReader(file)
     text = ""
     for page in reader.pages:
         page_text = page.extract_text()
@@ -250,13 +227,14 @@ def read_pdf(file_path):
             text += page_text + "\n"
     return text
 
-def read_docx(file_path):
-    document = Document(file_path)
+
+def read_docx(file):
+    document = Document(file)
     text = ""
     for paragraph in document.paragraphs:
         if paragraph.text.strip():
             text += paragraph.text + "\n"
-    
+
     for table in document.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -265,66 +243,66 @@ def read_docx(file_path):
     return text
 
 
-def read_resume(file_path):
-    if file_path.suffix.lower() == ".pdf":
-        return read_pdf(file_path)
-    elif file_path.suffix.lower() == ".docx":
-        return read_docx(file_path)
+def read_resume(file, filename):
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".pdf":
+        text = read_pdf(file)
+    elif suffix == ".docx":
+        text = read_docx(file)
     else:
-        return None
+        raise ValueError(f"Unsupported file type: {suffix} (use .pdf or .docx)")
+    if not text.strip():
+        raise ValueError("No text found in file (is it a scanned image?)")
+    return text
 
 
-
-# lets do it now
-resume_folder = Path("resumes")
-all_results=[]
-for file_path in resume_folder.iterdir():
-    #C:\Users\Pratyush\padho_with_pratyush\week1\day5\resumes\abhay resume new - Abhay Singh.pdf
-    if file_path.suffix.lower() not in [".pdf", ".docx"]:
-        continue
-    print("\nProcessing:", file_path.name)
-    resume_text = read_resume(file_path)
-    parsed_resume=parse_resume(resume_text) # llm call1
-    time.sleep(5)
-    result = final_score(job, parsed_resume) #llm caLL2
-    #score and details
-    #acount chtgpt
-    # request bhejna shhur krega millions
-    #chattgot server jam ho jayega
-    time.sleep(5)
-    print("Score:", result.score)
-    all_results.append({
-        "name": parsed_resume.name,
-        "score": result.score,
-        "details": result.details
-    })
-all_results.sort(
-    key=lambda candidate: candidate["score"],
-    reverse=True
-)
-top_2 = all_results[:2]
-worst_2 = all_results[-2:]
+def print_candidate(candidate):
+    print(candidate["name"], "-", candidate["score"], "%")
+    print("  Matching:", ", ".join(candidate["matching_skills"]))
+    print("  Missing:", ", ".join(candidate["missing_skills"]))
+    print("  Verdict:", candidate["verdict"])
 
 
-print("TOP 2 CANDIDATES")
-for candidate in top_2:
+def main():
+    job = parse_job(job_description)
+    print("Role:", job.role)
 
-    print(
-        candidate["name"],
-        "-",
-        candidate["score"],
-        "%"
-    )
+    resume_folder = Path("resumes")
+    all_results=[]
+    for file_path in resume_folder.iterdir():
+        if file_path.suffix.lower() not in [".pdf", ".docx"]:
+            continue
+        print("\nProcessing:", file_path.name)
+        try:
+            resume_text = read_resume(file_path, file_path.name)
+            parsed_resume=parse_resume(resume_text) # llm call1
+            time.sleep(5)  # stay under the groq rate limit
+            result = final_score(job, parsed_resume) #llm call2
+            time.sleep(5)
+        except Exception as error:
+            print("  Skipped:", error)
+            continue
+        print("Score:", result.score)
+        all_results.append({
+            "name": parsed_resume.name or result.candidate_name or file_path.stem,
+            **result.model_dump(exclude={"candidate_name"}),
+        })
 
-    print(candidate["details"])
+    all_results.sort(key=lambda candidate: candidate["score"], reverse=True)
 
-print("LOWEST 2 CANDIDATES")
-for candidate in worst_2:
+    # with fewer than 4 resumes, top and bottom would overlap
+    half = len(all_results) // 2
+    top_2 = all_results[:min(2, len(all_results) - half)]
+    worst_2 = all_results[-min(2, half):] if half else []
 
-    print(
-        candidate["name"],
-        "-",
-        candidate["score"],
-        "%"
-    )
-    print(candidate["details"])
+    print("\nTOP CANDIDATES")
+    for candidate in top_2:
+        print_candidate(candidate)
+
+    print("\nLOWEST CANDIDATES")
+    for candidate in worst_2:
+        print_candidate(candidate)
+
+
+if __name__ == "__main__":
+    main()
